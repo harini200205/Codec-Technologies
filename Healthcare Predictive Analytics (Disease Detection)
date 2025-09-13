@@ -1,0 +1,389 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[2]:
+
+
+"""
+disease_predictor.py
+
+End-to-end example for Healthcare Predictive Analytics (Diabetes detection).
+Uses the Pima Indians Diabetes dataset (UCI). Swap DATA_URL to use other CSV datasets.
+
+Requirements (install if missing):
+pip install pandas numpy scikit-learn matplotlib seaborn imbalanced-learn xgboost shap joblib
+
+Author: ChatGPT (example script)
+"""
+
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split, StratifiedKFold, RandomizedSearchCV
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+                             confusion_matrix, classification_report, roc_curve, precision_recall_curve)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+
+# Optional libraries - gracefully handle if not installed
+try:
+    from xgboost import XGBClassifier
+    HAS_XGBOOST = True
+except Exception:
+    HAS_XGBOOST = False
+
+try:
+    import shap
+    HAS_SHAP = True
+except Exception:
+    HAS_SHAP = False
+
+try:
+    from imblearn.over_sampling import SMOTE
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    HAS_IMBLEARN = True
+except Exception:
+    HAS_IMBLEARN = False
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+import json
+import time
+
+# -----------------------
+# Configuration / paths
+# -----------------------
+DATASET = "pima"  # options: "pima" (default). To use heart dataset, change to "heart" and adjust DATA_URL/columns below.
+OUT_DIR = "output"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# Pima Indians Diabetes dataset (UCI) — CSV raw link (no header)
+# If you prefer Kaggle, download CSV and point to local path
+PIMA_URL = "https://raw.githubusercontent.com/jbrownlee/Datasets/master/pima-indians-diabetes.data.csv"
+PIMA_COLS = ['Pregnancies', 'Glucose', 'BloodPressure', 'SkinThickness', 'Insulin',
+             'BMI', 'DiabetesPedigreeFunction', 'Age', 'Outcome']
+
+# Optionally change to a heart disease CSV (make sure columns and label are set accordingly)
+# HEART_URL = "path_or_url_to_heart_dataset.csv"
+
+# -----------------------
+# Utility functions
+# -----------------------
+def load_dataset(dataset='pima', local_path=None):
+    """Load dataset. Currently supports 'pima'. If local_path provided, try that first."""
+    if dataset == 'pima':
+        if local_path and os.path.exists(local_path):
+            df = pd.read_csv(local_path)
+        else:
+            print("Downloading Pima dataset from GitHub raw...")
+            df = pd.read_csv(PIMA_URL, header=None, names=PIMA_COLS)
+        return df
+    else:
+        raise ValueError("Dataset not supported in this script. Swap DATA_URL & columns and adapt cleaning.")
+
+def summarize_data(df):
+    print("\nDataset shape:", df.shape)
+    print("\nHead:\n", df.head())
+    print("\nClass distribution:\n", df['Outcome'].value_counts(normalize=True))
+    print("\nMissing / zero counts (domain-specific zeros):")
+    print((df == 0).sum())
+
+def domain_cleaning_pima(df):
+    """
+    In Pima dataset, several numeric features use zero to encode missing:
+    'Glucose','BloodPressure','SkinThickness','Insulin','BMI'
+    Replace zeros with NaN and impute later with medians.
+    """
+    df = df.copy()
+    zero_as_missing = ['Glucose','BloodPressure','SkinThickness','Insulin','BMI']
+    for c in zero_as_missing:
+        df[c] = df[c].replace(0, np.nan)
+    return df
+
+def build_pipeline(use_smote=True, classifier='rf'):
+    """
+    Build an imblearn Pipeline (if available) that:
+     - imputes missing values (median)
+     - scales features (StandardScaler)
+     - (optionally) applies SMOTE
+     - fits classifier
+    classifier: 'lr', 'rf', 'xgb'
+    """
+    imputer = SimpleImputer(strategy='median')
+    scaler = StandardScaler()
+
+    if classifier == 'lr':
+        clf = LogisticRegression(max_iter=2000, solver='liblinear')
+    elif classifier == 'rf':
+        clf = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
+    elif classifier == 'xgb':
+        if not HAS_XGBOOST:
+            raise ImportError("XGBoost not installed. pip install xgboost to use it.")
+        clf = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42, n_jobs=-1)
+    else:
+        raise ValueError("Unknown classifier")
+
+    if HAS_IMBLEARN and use_smote:
+        pipeline = ImbPipeline(steps=[
+            ('imputer', imputer),
+            ('scaler', scaler),
+            ('smote', SMOTE(random_state=42)),
+            ('clf', clf)
+        ])
+    else:
+        # fallback: no SMOTE
+        pipeline = Pipeline(steps=[
+            ('imputer', imputer),
+            ('scaler', scaler),
+            ('clf', clf)
+        ])
+    return pipeline
+
+def evaluate_model(model, X_test, y_test, model_name="model"):
+    y_pred = model.predict(X_test)
+    if hasattr(model, "predict_proba"):
+        y_proba = model.predict_proba(X_test)[:,1]
+    elif hasattr(model, "decision_function"):
+        y_proba = model.decision_function(X_test)
+    else:
+        y_proba = None
+
+    results = {
+        "accuracy": accuracy_score(y_test, y_pred),
+        "precision": precision_score(y_test, y_pred, zero_division=0),
+        "recall": recall_score(y_test, y_pred, zero_division=0),
+        "f1": f1_score(y_test, y_pred, zero_division=0),
+    }
+    if y_proba is not None:
+        results["roc_auc"] = roc_auc_score(y_test, y_proba)
+    print(f"\n=== Evaluation: {model_name} ===")
+    print(pd.Series(results))
+    print("\nClassification report:\n", classification_report(y_test, y_pred, zero_division=0))
+    cm = confusion_matrix(y_test, y_pred)
+    print("Confusion matrix:\n", cm)
+    return results, y_proba, y_pred
+
+def plot_roc_pr(y_test, y_proba, out_prefix):
+    if y_proba is None:
+        print("No probability/scoring available to plot ROC/PR.")
+        return
+    fpr, tpr, _ = roc_curve(y_test, y_proba)
+    precision, recall, _ = precision_recall_curve(y_test, y_proba)
+
+    plt.figure()
+    plt.plot(fpr, tpr, label=f'ROC (AUC={roc_auc_score(y_test, y_proba):.3f})')
+    plt.plot([0,1],[0,1],'--', linewidth=0.7)
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    roc_path = os.path.join(OUT_DIR, f"{out_prefix}_roc.png")
+    plt.savefig(roc_path)
+    print("Saved ROC to", roc_path)
+
+    plt.figure()
+    pr_auc = np.trapz(recall[::-1], precision[::-1])  # approximate PR AUC
+    plt.plot(recall, precision, label=f'PR (AUC~{pr_auc:.3f})')
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("Precision-Recall Curve")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    pr_path = os.path.join(OUT_DIR, f"{out_prefix}_pr.png")
+    plt.savefig(pr_path)
+    print("Saved PR to", pr_path)
+
+def show_feature_importance(model, X_train, y_train, feature_names, out_prefix):
+    # Model-based importances if available
+    if hasattr(model, "named_steps"):
+        # model is a pipeline; extract classifier
+        clf = model.named_steps.get('clf', None)
+    else:
+        clf = model
+
+    if clf is None:
+        print("Classifier not found for feature importance.")
+        return
+
+    # If tree-based:
+    if hasattr(clf, "feature_importances_"):
+        fi = clf.feature_importances_
+        fi_series = pd.Series(fi, index=feature_names).sort_values(ascending=False)
+        plt.figure(figsize=(8,4))
+        sns.barplot(x=fi_series.values, y=fi_series.index)
+        plt.title("Model Feature Importances")
+        plt.tight_layout()
+        path = os.path.join(OUT_DIR, f"{out_prefix}_featimp_model.png")
+        plt.savefig(path)
+        print("Saved model feature importance to", path)
+    else:
+        print("Model has no attribute feature_importances_; skipping model-based importances.")
+
+    # Permutation importance (model-agnostic)
+    print("Computing permutation importance (may take a moment)...")
+    # For permutation importance we need an estimator that supports predict; use pipeline as-is
+    r = permutation_importance(model, X_train, y_train, n_repeats=10, random_state=42, n_jobs=-1)
+    perm_series = pd.Series(r.importances_mean, index=feature_names).sort_values(ascending=False)
+    plt.figure(figsize=(8,4))
+    sns.barplot(x=perm_series.values, y=perm_series.index)
+    plt.title("Permutation Importances (mean)")
+    plt.tight_layout()
+    path = os.path.join(OUT_DIR, f"{out_prefix}_perm_importance.png")
+    plt.savefig(path)
+    print("Saved permutation importance to", path)
+
+def explain_with_shap(model, X_sample, feature_names, out_prefix):
+    if not HAS_SHAP:
+        print("SHAP not installed; skip SHAP explanations (pip install shap).")
+        return
+    # if model is a pipeline, get inner classifier (tree or linear)
+    if hasattr(model, "named_steps"):
+        clf = model.named_steps.get('clf')
+    else:
+        clf = model
+
+    print("Computing SHAP values (this may take time)...")
+    try:
+        if hasattr(clf, "predict_proba") and (HAS_XGBOOST and isinstance(clf, XGBClassifier) or hasattr(clf, "feature_importances_")):
+            explainer = shap.TreeExplainer(clf)
+            shap_values = explainer.shap_values(X_sample)
+        else:
+            explainer = shap.KernelExplainer(clf.predict_proba, shap.sample(X_sample, 100))
+            shap_values = explainer.shap_values(X_sample)
+    except Exception as e:
+        print("SHAP explanation failed:", e)
+        return
+
+    # Summary plot saved to file
+    shap.summary_plot(shap_values, X_sample, feature_names=feature_names, show=False)
+    path = os.path.join(OUT_DIR, f"{out_prefix}_shap_summary.png")
+    plt.savefig(path, bbox_inches='tight')
+    print("Saved SHAP summary plot to", path)
+
+# -----------------------
+# Main pipeline
+# -----------------------
+def main():
+    start = time.time()
+    df = load_dataset(dataset=DATASET)
+    summarize_data(df)
+
+    # Domain-specific cleaning for Pima
+    if DATASET == 'pima':
+        df = domain_cleaning_pima(df)
+
+    # Quick EDA: missing counts
+    print("\nNaN counts after domain cleaning:\n", df.isna().sum())
+
+    # Split into X/y
+    label_col = 'Outcome' if 'Outcome' in df.columns else df.columns[-1]
+    X = df.drop(columns=[label_col])
+    y = df[label_col].astype(int)
+
+    # Train / test split (stratified)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
+    print(f"\nTrain shape: {X_train.shape}, Test shape: {X_test.shape}")
+
+    feature_names = X.columns.tolist()
+
+    # MODELS TO TRAIN
+    results_summary = {}
+
+    # Baseline Logistic Regression (with pipeline; do not SMOTE initially)
+    print("\n--- Training baseline Logistic Regression (no SMOTE) ---")
+    pipe_lr = build_pipeline(use_smote=False, classifier='lr')
+    pipe_lr.fit(X_train, y_train)
+    res_lr, y_proba_lr, _ = evaluate_model(pipe_lr, X_test, y_test, model_name="LogisticRegression")
+    results_summary['logistic'] = res_lr
+    show_feature_importance(pipe_lr, X_train, y_train, feature_names, out_prefix="lr")
+
+    # Random Forest (with SMOTE if available)
+    print("\n--- Training Random Forest (SMOTE if available) ---")
+    pipe_rf = build_pipeline(use_smote=HAS_IMBLEARN, classifier='rf')
+    pipe_rf.fit(X_train, y_train)
+    res_rf, y_proba_rf, _ = evaluate_model(pipe_rf, X_test, y_test, model_name="RandomForest")
+    results_summary['random_forest'] = res_rf
+    show_feature_importance(pipe_rf, X_train, y_train, feature_names, out_prefix="rf")
+
+    # XGBoost (if installed)
+    if HAS_XGBOOST:
+        print("\n--- Training XGBoost (SMOTE if available) ---")
+        pipe_xgb = build_pipeline(use_smote=HAS_IMBLEARN, classifier='xgb')
+        pipe_xgb.fit(X_train, y_train)
+        res_xgb, y_proba_xgb, _ = evaluate_model(pipe_xgb, X_test, y_test, model_name="XGBoost")
+        results_summary['xgboost'] = res_xgb
+        show_feature_importance(pipe_xgb, X_train, y_train, feature_names, out_prefix="xgb")
+    else:
+        print("\nXGBoost not available: skip XGBoost. To install: pip install xgboost")
+
+    # Plot ROC/PR for best model (simple comparator: pick highest roc_auc if present; else f1)
+    candidates = []
+    if y_proba_rf is not None:
+        candidates.append(('rf', pipe_rf, y_proba_rf))
+    if y_proba_lr is not None:
+        candidates.append(('lr', pipe_lr, y_proba_lr))
+    if HAS_XGBOOST and y_proba_xgb is not None:
+        candidates.append(('xgb', pipe_xgb, y_proba_xgb))
+
+    # Save model with best roc_auc
+    best = None
+    best_score = -1
+    for name, model_obj, proba in candidates:
+        if proba is None:
+            continue
+        score = roc_auc_score(y_test, proba)
+        if score > best_score:
+            best_score = score
+            best = (name, model_obj, proba)
+    if best is not None:
+        print(f"\nBest model by ROC-AUC: {best[0]} with AUC={best_score:.4f}")
+        plot_roc_pr(y_test, best[2], out_prefix=f"{best[0]}_best")
+        # Save model
+        model_path = os.path.join(OUT_DIR, f"best_model_{best[0]}.joblib")
+        joblib.dump(best[1], model_path)
+        print("Saved best model pipeline to", model_path)
+        # SHAP explain best model on a sample (optional)
+        try:
+            explain_with_shap(best[1], X_test.sample(min(200, len(X_test)), random_state=42), feature_names, out_prefix=f"{best[0]}_best")
+        except Exception as e:
+            print("SHAP or explanation failed:", e)
+    else:
+        print("No probabilistic model available to pick a best model.")
+
+    # Save summary metrics
+    summary_path = os.path.join(OUT_DIR, "results_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(results_summary, f, indent=2)
+    print("Saved summary results to", summary_path)
+
+    print("\nTotal elapsed time: {:.1f}s".format(time.time() - start))
+    print("\nEthical & privacy checklist (quick):")
+    print("- Ensure datasets are de-identified (no names, addresses, precise DOB).")
+    print("- Use secure storage + access controls for PHI (HIPAA / local law).")
+    print("- Document consent and provenance of data (Kaggle/UCI license).")
+    print("- Check for dataset bias and demographic representativeness.")
+    print("- Do clinical validation and prospective testing before deployment.")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
